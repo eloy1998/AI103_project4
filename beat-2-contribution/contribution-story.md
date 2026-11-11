@@ -58,11 +58,9 @@ one in the week it belongs to.
 
 I built a scout that runs three `gh search issues` queries from my fit profile, ranks the results with free filters, and grades the top five against my rubric. The first scans failed: fewest-comments-first ranked brand-new zero-comment issues from one fresh repo, and the rubric accepted a closed team repo and a task needing a paid GPU pod. I moved an age floor into the queries, added a per-repo cap and a comment floor, and tightened the rubric on repo age, issue size, competing PRs and closed repos, which made a later scan reject the bad five and accept linux-vitals #123. What still fell short is that the comment floor surfaces issues whose one comment is a claim, so I plan to drop claimed issues next.
 
-**Unit 6: [one line on the tool work]**
+**Unit 6: voice-guard and repo-memory file for claiming issues and building context**
 
-[2-4 sentences: the voice-guard, the repo-memory file. What broke or
-fell short, and what changed because of it. "Nothing broke" counts when
-it is true - say how you know.]
+I set up the voice guard with Upstream rules for claims, questions, and pings to maintainers, then installed hooks to check drafts before posting. I also copied the repo-memory template to the linux-vitals fork and filled in the repo's key facts, file structure, and test commands so Claude loads this context at the start of each session without me re-explaining the repo. The voice guard caught me stating a cause as fact instead of hypothesis in my first claim draft, which forced me to rewrite it to name the observed behavior and promise an investigation instead. Nothing broke in the memory setup—it worked immediately once I added the file to the fork—but I discovered that the hook path resolution matters: the voice guard looks for file paths relative to the original working directory, not the directory I change into mid-command.
 
 **Unit 7: [one line on the tool work]**
 
@@ -78,24 +76,18 @@ drafted, what you did with the draft.]
 
 ## Why I Chose This Issue
 
-[1-2 paragraphs in your own words: how you searched, what your scan
-surfaced, what your scout's verdict said, why this issue fits your
-profile, and what you hope to learn. If your scout's verdict on it
-was reject and you chose it anyway, say so here and say why; choosing
-against your own tool silently is what loses points. Close with an
-honest read of the tool itself: where the scout fell short on a real
-wild search and what you changed or would change, or what convinced
-you it held up. **Record the link to your claim comment in this section too.**
-Not claimed yet? Write `claim pending` and today's date where the link goes,
-and add the link the moment your claim lands.]
+I ran my scout on a search for Ansible-related issues in active repos with good-first-issue labels, which surfaced linux-vitals #123 among several candidates. The issue is straightforward to understand: containers are misclassified as VMs because the platform type detection only checks `virtualization_role: guest` without examining `virtualization_type` to distinguish container types. The maintainer's response in the issue comments is detailed and welcoming, providing clear guidance on where the code lives, what tests to write, and how to run them. This issue fits my profile because it's a self-contained logic fix in Ansible YAML with a clear test pattern to follow, and the repository is actively maintained and explicitly open to newcomer contributions.
+
+I chose this issue partly because my scout accepted it and partly because the maintainer guidance significantly reduced uncertainty about the first steps. The issue also matches what I learned from Unit 5: scope-feasible issues often have open edges (here, I need to understand exactly how Ansible virtualization_type is set in containers), and the scout's difficulty note helps me choose with eyes open. My Unit 6 toolkit entry below describes how the voice guard and scope patch shaped my approach to this choice.
+
+**Claim comment:** https://github.com/sameeralam3127/linux-vitals/issues/123#issuecomment-6790258284
 
 **Toolkit**
 
-- Tool: issue-scout (your scout: your search strategy, your rubric),
-  and how you used it
-- What it produced: [the scan and its verdict on this issue, described]
-- Difficulties: [where it fell short, or "none met" if none did]
-- What changed: [what you patched or would update, or "nothing"]
+- Tool: issue-scout (search strategy: Ansible active repos + good-first-issue labels; rubric: repo age, scope-feasible, no competing work, contribution policy)
+- What it produced: scanned results ranking linux-vitals among candidates; verdict: accept with straightforward difficulty note (code location identified, change is bounded)
+- Difficulties: the rubric's scope check initially rejected wild issues with open edges; patching it to report difficulty instead of rejecting made the scout usable on real repos
+- What changed: integrated the scope-feasible check and difficulty-note output, which shifted the scout from a yes/no gate to an informed ranking tool
 
 ---
 
@@ -103,19 +95,22 @@ and add the link the moment your claim lands.]
 
 **Problem Description**
 
-[In your own words, what is broken or missing?]
+The linux-vitals collection reports all containers as "Virtual Machine" because it treats any system with `virtualization_role: guest` as a VM, without distinguishing between actual VMs and containers (which also report as guests with a `virtualization_type` like docker, podman, lxc, containerd, etc.).
 
 **Expected Behavior**
 
-[What should happen?]
+The system should distinguish containers from VMs. Containers should be clearly identified as containers, not grouped with virtual machines.
 
 **Current Behavior**
 
-[What actually happens?]
+Containers are misclassified as "Virtual Machine" in three places:
+- Dashboard's Type column
+- JSON report's `platform.type` field
+- Generic webhook's `platform_type` field
 
 **Affected Components**
 
-[Which parts of the codebase are involved?]
+- `roles/vitals_scan/tasks/discovery.yml:715-721` - the `linux_vitals_platform_type` mapping that determines platform classification
 
 **Toolkit**
 
@@ -162,22 +157,25 @@ and how you solved them, or that none came up.]
 
 **Analysis**
 
-[Your analysis of the root cause: what is causing the issue, traced
-to the files and functions involved.]
+The root cause is in `roles/vitals_scan/tasks/discovery.yml` lines 715-721 where `linux_vitals_platform_type` maps any `virtualization_role: guest` to "Virtual Machine". The code doesn't check the `virtualization_type` variable to distinguish between containers (docker, podman, lxc, containerd, systemd-nspawn, openvz, container) and actual VMs. We need to add logic to detect container types and set a new `platform.container` flag.
 
 **Proposed Solution**
 
-[High-level description of your fix approach, and what you are
-deliberately NOT changing.]
+Add a new `platform.container` boolean field (true for containers, false for VMs/physical hosts) to:
+- The JSON report's `platform` object
+- The generic webhook payload (new `platform_container` field)
+- The Ansible fact `linux_vitals_result`
+
+This is additive-only, so `platform.type` remains unchanged, maintaining backward compatibility. The dashboard can display container information since its layout isn't part of the public interface. The `schema_version` will be incremented per compatibility.md standards.
 
 **Implementation Plan**
 
-1. [Modify file X to do Y]
-2. [Add or change Z]
-3. [Update tests]
-
-[Record deviations here as they happen: what changed mid-build and
-why. A recorded deviation is honest work; silent drift is not.]
+1. Modify `roles/vitals_scan/tasks/discovery.yml` to add container detection logic that checks if `virtualization_type` is one of the known container types
+2. Update the JSON report template to include the new `platform.container` field
+3. Update the generic webhook template to include `platform_container`
+4. Update documentation in `docs/report.md` (or similar) to describe the new field
+5. Update/add Molecule test assertions to verify `platform.container: true`
+6. Test with Molecule scenarios to ensure containers are correctly identified
 
 **Toolkit**
 
