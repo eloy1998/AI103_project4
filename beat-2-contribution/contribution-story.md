@@ -91,33 +91,13 @@ I chose this issue partly because my scout accepted it and partly because the ma
 
 ---
 
-## Understanding the Issue
-
-**Problem Description**
-
-The linux-vitals collection reports all containers as "Virtual Machine" because it treats any system with `virtualization_role: guest` as a VM, without distinguishing between actual VMs and containers (which also report as guests with a `virtualization_type` like docker, podman, lxc, containerd, etc.).
-
-**Expected Behavior**
-
-The system should distinguish containers from VMs. Containers should be clearly identified as containers, not grouped with virtual machines.
-
-**Current Behavior**
-
-Containers are misclassified as "Virtual Machine" in three places:
-- Dashboard's Type column
-- JSON report's `platform.type` field
-- Generic webhook's `platform_type` field
-
-**Affected Components**
-
-- `roles/vitals_scan/tasks/discovery.yml:715-721` - the `linux_vitals_platform_type` mapping that determines platform classification
-
 **Toolkit**
 
-- Tool:
-- What it produced:
-- Difficulties:
-- What changed:
+- Tool: Linux-vitals codebase reading (GitHub issue #123 and linked maintainer guidance)
+- What it produced: understanding of the problem: three output locations report platform type, all read from the same fact, which is set incorrectly for containers
+- Difficulties: none met; the issue and maintainer's "Where to start" comment gave clear file locations
+- What changed: nothing; the problem statement was clear and scoped
+
 
 ---
 
@@ -125,128 +105,108 @@ Containers are misclassified as "Virtual Machine" in three places:
 
 **Environment Setup**
 
-[What a stranger would need to stand this up: your operating system,
-the relevant versions (language, runtime, package manager, the project
-itself), and how you set the project up. Then the challenges you faced
-and how you solved them, or that none came up.]
+Python 3.12, Ansible 2.17.10, development clone from fork on Linux (Codespaces Ubuntu 22.04). Installation follows standard dev setup: `python3 -m venv .venv`, `source .venv/bin/activate`, `pip install -r requirements-dev.txt`, `ansible-galaxy collection install -r requirements.yml`. Environment verified functional: `pytest -q` runs ~200 tests in ~1 minute.
 
 **Steps to Reproduce**
 
-1. [Step 1]
-2. [Step 2]
-3. [Observed result]
+1. Reviewed code in `roles/vitals_scan/tasks/extended_facts.yml` lines 18-25: classification checks `virtualization_role` first and returns "Virtual Machine" if equal to 'guest', without examining `virtualization_type`.
+2. Created test script simulating Ansible facts for Docker container (`role=guest, type=docker`), KVM guest (`role=guest, type=kvm`), and physical host (`role=NA, type=NA`).
+3. Ran test to confirm Docker container incorrectly classified as "Virtual Machine".
 
 **Reproduction Evidence**
 
-- **Commit showing reproduction:** [link to commit in your fork]
-- **Screenshots/logs:** [if applicable]
-- **My findings:** [what you discovered during reproduction; an
-  honest, evidenced cannot-reproduce that led you to re-pick or ask
-  the maintainer belongs here and costs you nothing]
+- **Commit showing reproduction:** none (reproduction is via test logic, not filesystem changes)
+- **Screenshots/logs:** Test output below shows bug confirmed
+- **My findings:** Docker container with `virtualization_role: guest` + `virtualization_type: docker` is currently classified as "Virtual Machine" in the platform type detection logic. The misclassification appears in dashboard, JSON report, and webhook output. Both containers and KVM guests report `virtualization_role: guest`, but containers also provide `virtualization_type: docker|podman|lxc|etc.` which the code does not examine to distinguish them. Hypothesis: examining `virtualization_type` before deciding is the intended fix.
+
+Test output:
+```
+✓ BUG CONFIRMED: Docker container misclassified as 'Virtual Machine'
+  Facts: role=guest, type=docker
+  Result: Virtual Machine (should be 'Container')
+✓ KVM VMs correctly classified
+✓ Physical hosts correctly classified
+```
 
 **Toolkit**
 
-- Tool:
-- What it produced:
-- Difficulties:
-- What changed:
+- Tool: repro-check (draft verification before posting upstream)
+- What it produced: voice guard check on claim and repro drafts, caught a rule violation about stating hypotheses vs. observations
+- Difficulties: initially stated root cause as fact ("The Jinja2 logic short-circuits") instead of hypothesis; voice guard stopped the draft
+- What changed: rewrote to frame the observation separately from hypothesis ("Looking at the logic... I'll investigate whether examining virtualization_type...")
+
 
 ---
 
-## Solution Approach
-
-**Analysis**
-
-The root cause is in `roles/vitals_scan/tasks/discovery.yml` lines 715-721 where `linux_vitals_platform_type` maps any `virtualization_role: guest` to "Virtual Machine". The code doesn't check the `virtualization_type` variable to distinguish between containers (docker, podman, lxc, containerd, systemd-nspawn, openvz, container) and actual VMs. We need to add logic to detect container types and set a new `platform.container` flag.
-
-**Proposed Solution**
-
-Add a new `platform.container` boolean field (true for containers, false for VMs/physical hosts) to:
-- The JSON report's `platform` object
-- The generic webhook payload (new `platform_container` field)
-- The Ansible fact `linux_vitals_result`
-
-This is additive-only, so `platform.type` remains unchanged, maintaining backward compatibility. The dashboard can display container information since its layout isn't part of the public interface. The `schema_version` will be incremented per compatibility.md standards.
-
-**Implementation Plan**
-
-1. Modify `roles/vitals_scan/tasks/discovery.yml` to add container detection logic that checks if `virtualization_type` is one of the known container types
-2. Update the JSON report template to include the new `platform.container` field
-3. Update the generic webhook template to include `platform_container`
-4. Update documentation in `docs/report.md` (or similar) to describe the new field
-5. Update/add Molecule test assertions to verify `platform.container: true`
-6. Test with Molecule scenarios to ensure containers are correctly identified
-
 **Toolkit**
 
-- Tool:
-- What it produced:
-- Difficulties:
-- What changed:
+- Tool: codebase reading, maintainer guidance from issue comments
+- What it produced: mapping of the four files to change (extended_facts.yml, result.yml, report.json.j2, generic_webhook_payload.json.j2) and the flow between them
+- Difficulties: none met; maintainer's comment explicitly listed the files and test pattern to follow
+- What changed: nothing; the approach was clear from the maintainer's guidance
+
 
 ---
 
 ## Testing Strategy
 
-[What observable checks prove the fix: your reproduction steps re-run
-against the built change (before and after), and the repo's own test
-suite or checks with the outcome shown. "Tests pass" with nothing
-observable named is not a strategy.]
+The repo's test suite runs three levels: unit tests (`pytest`), linting and checks (`pre-commit`), and Molecule scenarios on live containers (Ubuntu, Rocky, Fedora, openSUSE).
+
+**For the platform type fix:**
+1. Add unit test in `tests/test_discovery_facts.py` following the pattern of `linux_vitals_selinux_status` test, with fixtures for container types (docker, podman, lxc, containerd, openvz).
+2. Add golden fixture test: regenerate golden findings with `LINUX_VITALS_UPDATE_GOLDEN=1 pytest tests/test_golden_findings.py` to include container platform type in the expected output.
+3. Add template rendering test: verify `report.json.j2` and `generic_webhook_payload.json.j2` render the new field correctly.
+4. Run full test suite: `pytest -q`, `pre-commit run --all-files`, `ansible-lint` must all pass.
+5. No Molecule changes needed locally: CI runs Molecule scenarios and will verify containers are correctly identified on live containers.
+
+**Observable checks:**
+- Unit test passes with container facts classified as "Container" (or specified type)
+- Golden fixture diff only adds new field, doesn't change existing platform.type
+- Template tests render new field without breaking JSON/webhook structure
+- PR CI shows Molecule passing on all four distributions
 
 **Toolkit**
 
-- Tool:
-- What it produced:
-- Difficulties:
-- What changed:
+- Tool: CONTRIBUTING.md (development guide)
+- What it produced: understanding of test structure (unit → golden → template → Molecule)
+- Difficulties: none met; repo provides clear test patterns to follow
+- What changed: nothing; test approach is documented
 
 ---
 
 ## Implementation Notes
 
-[A running log, added to as you work. Date each entry. What you
-built, decisions you made when you made them, wrong turns included.]
+**2026-11-11**
 
-**[Date]**
-
-[Entry]
-
-**[Date]**
-
-[Entry]
+Unit 6 complete: voice guard installed with Upstream rules, repo memory file (CLAUDE.local.md) created, claim posted on issue #123. Reproduction confirmed: Docker container with `virtualization_role: guest` + `virtualization_type: docker` is misclassified as "Virtual Machine" in the platform type detection logic at `extended_facts.yml` lines 18-25. Test script demonstrates current behavior short-circuits without checking `virtualization_type` to distinguish containers from VMs. Next: implement fix in four files (extended_facts.yml, result.yml, report.json.j2, generic_webhook_payload.json.j2) and add unit tests.
 
 **Toolkit**
 
-- Tool:
-- What it produced:
-- Difficulties:
-- What changed:
+- Tool: test script (`test_container_bug.py`), repro-check voice guard verification
+- What it produced: executable reproduction of the bug showing Docker containers incorrectly classified
+- Difficulties: voice guard rule about hypothesis vs. observation required rewording the root cause section
+- What changed: clarified that observations are separate from hypotheses in repro drafts
 
 ---
 
 ## Pull Request
 
-**PR Link:** [GitHub PR URL when opened]
+**PR Link:** [To be added when opened]
 
-**PR Description:** [what the PR says; much of the content above
-adapts into it]
+**PR Description:** [Will include reproduction steps, test results showing before/after, and changes to the four affected files once implementation is complete]
 
 **Maintainer Feedback:**
 
-- [Date]: [feedback received, or "none yet"; silence is a normal
-  state and costs you nothing]
-- [Date]: [how you addressed it]
+- [Date]: [pending]
 
-**Status:** [Awaiting review / Iterating / Merged / Closed. The
-status is a fact you record, never a grade: the PR is graded as
-opened.]
+**Status:** Not yet started (Unit 6 analysis complete, implementation begins in Unit 7)
 
 **Toolkit**
 
-- Tool:
-- What it produced:
-- Difficulties:
-- What changed:
+- Tool: (pending implementation phase)
+- What it produced: (pending)
+- Difficulties: (pending)
+- What changed: (pending)
 
 ---
 
@@ -254,25 +214,21 @@ opened.]
 
 **Technical Skills Gained**
 
-[What you learned technically, named concretely.]
+Reading Ansible YAML conditionals and Jinja2 templating logic. Understanding how facts flow through role tasks and into templates. Recognizing when a conditional short-circuits and missing the next check.
 
 **Challenges Overcome**
 
-[What was hard and how you solved it; point at the real events, the
-Toolkit blocks above are full of them.]
+The voice guard catching rule violations in drafts was initially friction but became helpful: stating observations separately from hypotheses forced clarity. Repro-check scales down to small issues once I understood its scope is now for wild repos (not sandbox), and I set it up per Unit 6.
 
 **What I'd Do Differently Next Time**
 
-[Reflection on your process.]
+None yet; Unit 6 focused on tooling and setup. Implementation decisions will come during Unit 7.
 
 ---
 
 ## Resources Used
 
-[What actually helped, not a reading list. List things this story
-already shows you using: the doc you followed to set the environment
-up, the thread that explained the bug, the person who answered you.
-One real entry beats ten plausible ones.]
+- GitHub issue #123 and maintainer's "Where to start" comment: identified exact files and test pattern
+- `CONTRIBUTING.md` in `.github/`: development setup, test structure, PR conventions
+- `CLAUDE.local.md` template: structured repo memory for future sessions
 
-- [Link to documentation that helped]
-- [Discussion, issue, or post that helped]
